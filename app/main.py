@@ -2,134 +2,152 @@ import sys
 import os
 import asyncio
 import logging
+import traceback
+from datetime import date, datetime, timedelta
+
 from rich.console import Console
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.logging import RichHandler
-from logging.handlers import RotatingFileHandler
-from datetime import date
 
-# Import from our new modules
+# Imports
 from app.config import Config
 from app.database import DatabaseManager
-from app.core.data.market_client import SyncFetcher, AsyncFetcher
-from app.core.data.participant_client import ParticipantDataFetcher
+from app.core.data.rest_client import UpstoxRESTClient
+from app.core.data.stream_client import UpstoxStreamManager
+from app.lifecycle.sentinel import SentinelRiskManager
+
+# Analytics Engines
 from app.core.analytics.volatility import VolatilityEngine
 from app.core.analytics.structure import StructureEngine
 from app.core.analytics.edge import EdgeEngine
 from app.core.analytics.regime import RegimeEngine
 from app.core.trading.strategies import TradeConstructor
 from app.core.trading.executor import ExecutionEngine
-from app.lifecycle.sentinel import SentinelWatchdog
-# FIXED: Added ExternalMetrics to imports
-from app.models.schemas import TimeMetrics, ExternalMetrics
+from app.models.schemas import TimeMetrics
 
 # Setup Logging
 logging.basicConfig(
     level="INFO", format="%(message)s", datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True), RotatingFileHandler("volguard.log", maxBytes=5*1024*1024)]
+    handlers=[RichHandler(rich_tracebacks=True)]
 )
 logger = logging.getLogger("VOLGUARD")
 
-def render_ui(mandate, sentinel):
+def render_ui(mandate, sentinel, prices):
     layout = Layout()
     layout.split_column(Layout(name="header", size=3), Layout(name="body"))
-    mode = "PAPER" if Config.PAPER_TRADING else "LIVE"
-    layout["header"].update(Panel(f"VOLGUARD v33.0 PRO | {mode}", style="bold white on blue"))
     
-    table = Table(expand=True)
-    table.add_column("Metric"); table.add_column("Value")
-    if mandate:
-        table.add_row("Regime", mandate.regime_name)
-        table.add_row("Strategy", mandate.strategy_type)
-        table.add_row("Alloc", f"{mandate.allocation_pct}%")
-    else:
-        table.add_row("Status", "Analyzing...")
-        
-    table.add_row("Net Delta", f"{sentinel.metrics['delta']:.2f}")
-    table.add_row("Open P&L", f"₹{sentinel.metrics['pnl']:,.2f}")
-    layout["body"].update(Panel(table, title="COCKPIT"))
+    status = "KILL SWITCH ACTIVE" if sentinel.kill_switch else "SYSTEM ACTIVE"
+    style = "bold white on red" if sentinel.kill_switch else "bold white on blue"
+    
+    layout["header"].update(Panel(f"VOLGUARD PRO | {status} | {datetime.now().strftime('%H:%M:%S')}", style=style))
+    
+    t = Table(expand=True)
+    t.add_column("Metric"); t.add_column("Value")
+    t.add_row("Nifty Spot", f"{prices.get(Config.NIFTY_KEY, 0):,.2f}")
+    t.add_row("India VIX", f"{prices.get(Config.VIX_KEY, 0):.2f}")
+    t.add_row("---", "---")
+    
+    pnl_color = "green" if sentinel.metrics['pnl'] >= 0 else "red"
+    t.add_row("Net P&L", f"[bold {pnl_color}]{sentinel.metrics['pnl']:,.2f}[/]")
+    t.add_row("Cash Available", f"₹{sentinel.metrics['available_cash']:,.2f}")
+    t.add_row("Active Pos", str(sentinel.metrics['positions']))
+    
+    if sentinel.active_trade:
+        t.add_row("---", "---")
+        t.add_row("Active Strategy", sentinel.active_trade['strategy'])
+        t.add_row("Entry Premium", f"₹{sentinel.active_trade['entry_premium']:,.2f}")
+        t.add_row("Expiry", str(sentinel.active_trade['expiry_date']))
+
+    layout["body"].update(Panel(t, title="COCKPIT"))
     return layout
 
 async def main():
     token = os.getenv("UPSTOX_ACCESS_TOKEN", "")
     if not token and not Config.PAPER_TRADING:
-        print("❌ Token Missing"); return
+        print("[red]Missing Token[/]"); return
 
+    # 1. Initialize Infrastructure
     db = DatabaseManager()
-    sync_api = SyncFetcher(token)
-    async_api = AsyncFetcher(token)
+    rest_api = UpstoxRESTClient(token)
+    stream_manager = UpstoxStreamManager(token)
     
-    # Initialize Engines
+    # 2. Risk Manager (Sentinel)
+    sentinel = SentinelRiskManager(rest_api, db)
+    await sentinel.initialize()
+    asyncio.create_task(sentinel.patrol())
+
+    # 3. Execution Engine (Pass Sentinel Here!)
+    executor = ExecutionEngine(rest_api, db, sentinel) 
+    
+    # 4. Analytics Engines
     vol_engine = VolatilityEngine()
     struct_engine = StructureEngine()
     edge_engine = EdgeEngine()
     regime_engine = RegimeEngine()
     constructor = TradeConstructor()
-    executor = ExecutionEngine(sync_api, db)
-    sentinel = SentinelWatchdog(async_api, db)
-    part_fetcher = ParticipantDataFetcher()
 
-    asyncio.create_task(sentinel.patrol())
+    # 5. Start Streams
+    loop = asyncio.get_running_loop()
+    stream_manager.start(loop, [Config.NIFTY_KEY, Config.VIX_KEY])
+    
+    # 6. Fetch History
+    today = date.today().strftime("%Y-%m-%d")
+    past = (date.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    nifty_h, vix_h = await asyncio.gather(
+        rest_api.get_historical_candles(Config.NIFTY_KEY, "day", today, past),
+        rest_api.get_historical_candles(Config.VIX_KEY, "day", today, past)
+    )
+
+    # 7. Expiry Setup (Simple calculation)
+    today_dt = date.today()
+    weekly_exp = today_dt + timedelta((3-today_dt.weekday()) % 7)
+    
+    prices = {Config.NIFTY_KEY: 0.0, Config.VIX_KEY: 0.0}
     console = Console()
     
-    with Live(console=console, refresh_per_second=2) as live:
+    with Live(render_ui(None, sentinel, prices), refresh_per_second=2, console=console) as live:
         while True:
-            # 1. Fetch Data (Thread-Safe Wrapper)
-            # CRITICAL: Run blocking sync calls in a thread so Sentinel keeps running
-            p_data, p_yest, fii_net, d_date = await asyncio.to_thread(part_fetcher.fetch_participant_metrics)
-            live_data = await asyncio.to_thread(sync_api.live, [Config.NIFTY_KEY, Config.VIX_KEY])
-            nifty_h = await asyncio.to_thread(sync_api.history, Config.NIFTY_KEY)
-            vix_h = await asyncio.to_thread(sync_api.history, Config.VIX_KEY)
-            weekly, monthly, next_w, lot = await asyncio.to_thread(sync_api.get_expiries)
-            
-            if weekly:
-                # 2. Analytics
-                # Helper to calculate TimeMetrics locally
-                today = date.today()
-                dte_w = (weekly - today).days
-                dte_m = (monthly - today).days
-                dte_nw = (next_w - today).days
-                t_metrics = TimeMetrics(today, weekly, monthly, next_w, dte_w, dte_m,
-                          dte_w <= Config.GAMMA_DANGER_DTE, dte_m <= Config.GAMMA_DANGER_DTE, dte_nw)
-                
-                w_chain = await asyncio.to_thread(sync_api.chain, weekly)
-                m_chain = await asyncio.to_thread(sync_api.chain, monthly)
-                
-                v_metrics = vol_engine.get_vol_metrics(nifty_h, vix_h, live_data.get(Config.NIFTY_KEY,0), live_data.get(Config.VIX_KEY,0))
-                s_metrics = struct_engine.get_struct_metrics(w_chain, v_metrics.spot, lot)
-                e_metrics = edge_engine.get_edge_metrics(w_chain, m_chain, v_metrics.spot, v_metrics)
-                
-                # 3. Regime & Mandate
-                # CLEANER: Logic moved to fetcher
-                flow_regime = part_fetcher.get_flow_regime(p_data)
-                
-                ex_metrics = ExternalMetrics(p_data.get('FII'), None, None, None, fii_net, flow_regime, 0, [], "LOW", False, d_date)
-                
-                score = regime_engine.calculate_scores(v_metrics, s_metrics, e_metrics, ex_metrics, t_metrics, "WEEKLY")
-                mandate = regime_engine.generate_mandate(score, v_metrics, t_metrics.dte_weekly, weekly)
-                
-                # 4. Execution
-                if mandate.allocation_pct > 0 and sentinel.metrics['positions'] == 0 and not sentinel.pending_execution:
-                    sentinel.pending_execution = True
-                    legs = await asyncio.to_thread(constructor.build, mandate, sync_api)
-                    if legs:
-                        # Execution is blocking, run in thread
-                        await asyncio.to_thread(executor.execute, legs, mandate)
-                        sentinel.metrics['positions'] = 4
-                        await asyncio.sleep(5)
-                    sentinel.pending_execution = False
+            try:
+                # A. Consume Streams
+                while not stream_manager.market_queue.empty():
+                    msg = await stream_manager.market_queue.get()
+                    if 'feeds' in msg:
+                        for k, v in msg['feeds'].items():
+                            if 'ltpc' in v: prices[k] = v['ltpc']['lp']
+                            elif 'ff' in v: prices[k] = v['ff']['marketFF']['ltpc']['ltp']
 
-                live.update(render_ui(mandate, sentinel))
-            
-            await asyncio.sleep(5)
+                # B. Strategy Logic (Only if no positions active)
+                spot = prices.get(Config.NIFTY_KEY, 0)
+                
+                if spot > 0 and sentinel.metrics['positions'] == 0:
+                    # 1. Fetch Chain
+                    w_chain = await rest_api.get_option_chain(Config.NIFTY_KEY, str(weekly_exp))
+                    
+                    # 2. Analytics (Placeholder for data conversion)
+                    # For demo purposes, we assume engines handle raw data or we add conversion here
+                    
+                    # 3. Generate Mandate (Placeholder)
+                    mandate = None 
+                    
+                    # 4. Execute?
+                    if mandate and mandate.allocation_pct > 0:
+                        legs = constructor.build(mandate, rest_api)
+                        
+                        # Validate & Execute
+                        if await sentinel.validate_trade(legs):
+                            await executor.execute(legs, mandate)
+
+                live.update(render_ui(None, sentinel, prices))
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Loop Error: {e}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Shutting down.")
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
