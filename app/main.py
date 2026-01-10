@@ -23,6 +23,7 @@ from app.core.analytics.regime import RegimeEngine
 from app.core.trading.strategies import TradeConstructor
 from app.core.trading.executor import ExecutionEngine
 from app.lifecycle.sentinel import SentinelWatchdog
+# FIXED: Added ExternalMetrics to imports
 from app.models.schemas import TimeMetrics, ExternalMetrics
 
 # Setup Logging
@@ -101,14 +102,12 @@ async def main():
                 s_metrics = struct_engine.get_struct_metrics(w_chain, v_metrics.spot, lot)
                 e_metrics = edge_engine.get_edge_metrics(w_chain, m_chain, v_metrics.spot, v_metrics)
                 
-                # Helper for External Metrics
-                flow = "NEUTRAL"
-                if p_data and p_data.get('FII'):
-                    if p_data['FII'].fut_net > Config.FII_STRONG_LONG: flow = "STRONG_LONG"
-                    elif p_data['FII'].fut_net < Config.FII_STRONG_SHORT: flow = "STRONG_SHORT"
-                ex_metrics = ExternalMetrics(p_data.get('FII'), None, None, None, fii_net, flow, 0, [], "LOW", False, d_date)
-                
                 # 3. Regime & Mandate
+                # CLEANER: Logic moved to fetcher
+                flow_regime = part_fetcher.get_flow_regime(p_data)
+                
+                ex_metrics = ExternalMetrics(p_data.get('FII'), None, None, None, fii_net, flow_regime, 0, [], "LOW", False, d_date)
+                
                 score = regime_engine.calculate_scores(v_metrics, s_metrics, e_metrics, ex_metrics, t_metrics, "WEEKLY")
                 mandate = regime_engine.generate_mandate(score, v_metrics, t_metrics.dte_weekly, weekly)
                 
