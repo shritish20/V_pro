@@ -1,0 +1,10 @@
+pandas
+numpy
+requests
+colorama
+tabulate
+arch
+scipy
+pytz
+rich
+aiohttp
