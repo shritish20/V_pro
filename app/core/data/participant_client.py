@@ -59,3 +59,15 @@ class ParticipantDataFetcher:
                 )
             except: data[p] = None
         return data
+
+    # --- NEW METHOD: Encapsulated Logic ---
+    @staticmethod
+    def get_flow_regime(p_data):
+        """Determines the FII Flow Regime based on Config thresholds."""
+        if not p_data or not p_data.get('FII'):
+            return "NEUTRAL"
+        
+        net_fut = p_data['FII'].fut_net
+        if net_fut > Config.FII_STRONG_LONG: return "STRONG_LONG"
+        if net_fut < Config.FII_STRONG_SHORT: return "STRONG_SHORT"
+        return "NEUTRAL"
