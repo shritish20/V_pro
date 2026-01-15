@@ -3629,5 +3629,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-What's your honest take
